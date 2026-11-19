@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站关注迁移助手（A → B）
 // @namespace    local.bilibili-follow-migrator
-// @version      1.0.0
+// @version      1.0.1
 // @description  导出自己的关注列表，切换账号后去重迁移；限速、暂停续传、失败重试与结果核对。
 // @match        https://www.bilibili.com/*
 // @noframes
@@ -17,7 +17,7 @@
   'use strict';
   const FORMAT = 'bilibili-follow-migration/v1';
   const STATUSES = ['pending', 'sending', 'success', 'existing', 'self', 'failed'];
-  const RISK = new Set([-352, -412, -509, -799, 412, 429]);
+  const RISK = new Set([-352, -412, -509, -799, 412, 429, 22015]);
   const HALT = new Set([-101, -102, -111, 22009, 'ACCOUNT', 'PAUSED', 'NETWORK', 'PROTOCOL']);
   function fault(message, code) { return Object.assign(new Error(message), { code }); }
   function uid(value) {
