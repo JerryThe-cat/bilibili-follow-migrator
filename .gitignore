@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+*.log
+B站关注_A-*.json
+B站迁移报告_B-*.json
+界面预览-模拟数据.png
+
+# Local verification only
+*.test.cjs
+browser-smoke.cjs

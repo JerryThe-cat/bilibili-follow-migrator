@@ -1,0 +1,296 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>B站关注迁移助手 · 安装</title><style>body{font:16px/1.8 system-ui,sans-serif;max-width:780px;margin:60px auto;padding:0 24px;color:#23374a;background:#f5f8fb}main{background:white;padding:32px;border:1px solid #dde6ef;border-radius:18px}h1{font-size:27px;line-height:1.4}button{background:#007fa4;color:white;border:0;border-radius:9px;padding:14px 22px;font:inherit;cursor:pointer}a{color:#007fa4}textarea{box-sizing:border-box;width:100%;height:260px;font:12px/1.5 monospace;border:1px solid #ccd9e4;padding:12px}#message{color:#00728f}li{margin:10px 0}.muted{color:#627386}</style><main><h1>B站关注迁移助手</h1><p>从 A 导出 → 在 B 比对 → 跳过已有关注 → 限速迁移。</p><ol><li>安装 <a href="https://www.tampermonkey.net/" target="_blank" rel="noopener">Tampermonkey 扩展</a>，按扩展提示允许用户脚本执行。</li><li>点击下方按钮复制完整脚本。</li><li>打开 Tampermonkey → 添加新脚本，删除默认模板，粘贴并按 <b>Command + S</b> 保存。</li><li>打开 <a href="https://www.bilibili.com/" target="_blank" rel="noopener">B站首页</a>并刷新，点击右下角“关注迁移 A → B”。</li></ol><button id="copy">复制完整脚本</button><p id="message" role="status"></p><p><a href="使用说明.txt">打开完整使用说明</a> · <a href="bilibili-follow-migrator.user.js">直接安装脚本</a> · <a href="https://github.com/JerryThe-cat/bilibili-follow-migrator" target="_blank" rel="noopener">GitHub 仓库</a></p><details><summary>查看脚本 / 手动复制</summary><textarea id="code" readonly spellcheck="false">// ==UserScript==
+// @name         B站关注迁移助手（A → B）
+// @namespace    local.bilibili-follow-migrator
+// @version      1.0.0
+// @description  导出自己的关注列表，切换账号后去重迁移；限速、暂停续传、失败重试与结果核对。
+// @match        https://www.bilibili.com/*
+// @noframes
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  &#x27;use strict&#x27;;
+  const FORMAT = &#x27;bilibili-follow-migration/v1&#x27;;
+  const STATUSES = [&#x27;pending&#x27;, &#x27;sending&#x27;, &#x27;success&#x27;, &#x27;existing&#x27;, &#x27;self&#x27;, &#x27;failed&#x27;];
+  const RISK = new Set([-352, -412, -509, -799, 412, 429]);
+  const HALT = new Set([-101, -102, -111, 22009, &#x27;ACCOUNT&#x27;, &#x27;PAUSED&#x27;, &#x27;NETWORK&#x27;, &#x27;PROTOCOL&#x27;]);
+  function fault(message, code) { return Object.assign(new Error(message), { code }); }
+  function uid(value) {
+    if (typeof value === &#x27;number&#x27; &amp;&amp; !Number.isSafeInteger(value)) throw fault(&#x27;UID 数字精度不可靠，请重新导出。&#x27;, &#x27;FORMAT&#x27;);
+    const s = String(value ?? &#x27;&#x27;);
+    if (!/^[1-9]\d{0,19}$/.test(s)) throw fault(&#x27;文件包含无效 UID。&#x27;, &#x27;FORMAT&#x27;);
+    return s;
+  }
+  function normalize(raw) {
+    if (!raw || raw.format !== FORMAT || raw.complete !== true || !Array.isArray(raw.users) || raw.users.length &gt; 20000)
+      throw fault(&#x27;请选择本助手完整导出的关注 JSON 文件。&#x27;, &#x27;FORMAT&#x27;);
+    const source = { uid: uid(raw.source?.uid), name: String(raw.source?.name || &#x27;&#x27;).slice(0, 100) };
+    if (!Number.isInteger(raw.total) || raw.total !== raw.users.length) throw fault(&#x27;文件人数不一致，拒绝导入。&#x27;, &#x27;FORMAT&#x27;);
+    const users = raw.users.map(u =&gt; ({ uid: uid(u.uid), name: String(u.name || &#x27;&#x27;).slice(0, 100) }));
+    if (new Set(users.map(u =&gt; u.uid)).size !== users.length) throw fault(&#x27;文件存在重复 UID，请重新导出。&#x27;, &#x27;FORMAT&#x27;);
+    return { format: FORMAT, complete: true, source, total: users.length, exportedAt: String(raw.exportedAt || &#x27;&#x27;), users };
+  }
+  async function collect(account, api, wait, checkpoint, progress = () =&gt; {}) {
+    await checkpoint(account.uid);
+    const before = (await api(&#x27;/x/relation/stat&#x27;, { vmid: account.uid })).following;
+    if (!Number.isInteger(before) || before &lt; 0 || before &gt; 20000) throw fault(&#x27;关注总数异常。&#x27;, &#x27;PROTOCOL&#x27;);
+    const seen = new Map();
+    for (let pn = 1; pn &lt;= Math.ceil(before / 50); pn++) {
+      await checkpoint(account.uid);
+      const data = await api(&#x27;/x/relation/followings&#x27;, { vmid: account.uid, pn, ps: 50, order: &#x27;desc&#x27;, order_type: &#x27;attention&#x27; });
+      if (!data || !Array.isArray(data.list) || data.total !== before || !data.list.length)
+        throw fault(&#x27;关注列表不完整或读取期间发生变化，请稍后重新读取。&#x27;, &#x27;INCOMPLETE&#x27;);
+      for (const u of data.list) {
+        const id = uid(u.mid);
+        if (seen.has(id)) throw fault(&#x27;分页出现重复记录，不能确认列表完整，请重新读取。&#x27;, &#x27;INCOMPLETE&#x27;);
+        seen.set(id, { uid: id, name: String(u.uname || &#x27;&#x27;).slice(0, 100) });
+      }
+      progress(seen.size, before);
+      await wait(1600);
+    }
+    await checkpoint(account.uid);
+    const after = (await api(&#x27;/x/relation/stat&#x27;, { vmid: account.uid })).following;
+    if (after !== before || seen.size !== before) throw fault(`列表未通过完整性检查：读取 ${seen.size} / ${before}，当前总数 ${after}。`, &#x27;INCOMPLETE&#x27;);
+    return [...seen.values()];
+  }
+  function reconcile(job, current, verify = false) {
+    const set = new Set(current.map(u =&gt; uid(u.uid)));
+    for (const item of job.items) {
+      if (item.uid === job.target.uid) { item.status = &#x27;self&#x27;; item.error = &#x27;&#x27;; }
+      else if (set.has(item.uid)) {
+        item.status = [&#x27;success&#x27;, &#x27;sending&#x27;].includes(item.status) ? &#x27;success&#x27; : &#x27;existing&#x27;;
+        item.error = &#x27;&#x27;;
+      } else if (verify) { item.status = &#x27;failed&#x27;; item.error = &#x27;核对时 B 的关注列表中未找到&#x27;; }
+      else if (item.status !== &#x27;failed&#x27;) { item.status = &#x27;pending&#x27;; item.error = &#x27;&#x27;; }
+    }
+    job.verifiedAt = verify ? new Date().toISOString() : null;
+    return job;
+  }
+  function counts(job) {
+    return Object.fromEntries(STATUSES.map(s =&gt; [s, job?.items.filter(i =&gt; i.status === s).length || 0]));
+  }
+  async function runQueue(job, env, retry = false) {
+    const queue = job.items.filter(i =&gt; i.status === &#x27;pending&#x27; || (retry &amp;&amp; i.status === &#x27;failed&#x27;));
+    let consecutive = 0;
+    for (const item of queue) {
+      await env.wait(job.delay * 1000 + Math.floor(env.random() * 2000));
+      await env.checkpoint(job.target.uid);
+      item.status = &#x27;sending&#x27;; item.error = &#x27;&#x27;; item.attempts++;
+      job.verifiedAt = null;
+      env.save(job); // Persist before the write; interrupted requests are reconciled on resume.
+      try {
+        await env.follow(item.uid, job.target.uid);
+        item.status = &#x27;success&#x27;; consecutive = 0;
+      } catch (e) {
+        if (e.code === 22014) { item.status = &#x27;existing&#x27;; item.error = &#x27;&#x27;; consecutive = 0; }
+        else {
+          item.status = &#x27;failed&#x27;; item.error = String(e.message).slice(0, 300); consecutive++;
+          env.save(job);
+          if (RISK.has(e.code) || HALT.has(e.code) || consecutive &gt;= 3) throw e;
+        }
+      }
+      env.save(job);
+    }
+  }
+  const Core = { FORMAT, uid, normalize, collect, reconcile, counts, runQueue };
+  if (typeof module !== &#x27;undefined&#x27; &amp;&amp; module.exports) { module.exports = Core; return; }
+
+  const KEY = &#x27;bfm-migration-job-v1&#x27;;
+  const LOCK = &#x27;local-bilibili-follow-migration-v1&#x27;;
+  let job = GM_getValue(KEY, null), busy = false, paused = false, account = null;
+  let sourceFile = null;
+  const cookie = key =&gt; document.cookie.split(&#x27;;&#x27;).map(s =&gt; s.trim()).find(s =&gt; s.startsWith(key + &#x27;=&#x27;))?.slice(key.length + 1);
+  const host = document.createElement(&#x27;div&#x27;);
+  host.id = &#x27;bili-migration-assistant&#x27;;
+  const shadow = host.attachShadow({ mode: &#x27;open&#x27; });
+  shadow.innerHTML = `
+  &lt;style&gt;
+    :host{all:initial;font-family:system-ui,-apple-system,sans-serif;color:#203245;font-size:14px}
+    *{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;border:1px solid #d4e0e8;border-radius:8px;padding:9px 12px;background:#fff;color:#203245}button:disabled{opacity:.45;cursor:not-allowed}button:hover:enabled{border-color:#008bb5}.primary{background:#007fa4;color:white;border-color:#007fa4}
+    #launch{position:fixed;right:22px;bottom:32px;z-index:2147483646;box-shadow:0 3px 18px #0002}
+    #panel{position:fixed;right:20px;bottom:88px;z-index:2147483647;width:min(600px,calc(100vw - 30px));max-height:calc(100vh - 110px);overflow:auto;background:#f6f9fc;border:1px solid #c9d9e5;border-radius:16px;box-shadow:0 12px 60px #0003;padding:20px}
+    [hidden]{display:none!important}header{display:flex;justify-content:space-between;align-items:center}h2{font-size:20px;margin:0}h3{font-size:15px;margin:0 0 10px}p{line-height:1.65;margin:8px 0;color:#53677b}section{background:white;border:1px solid #e0e8ef;border-radius:10px;padding:14px;margin-top:12px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.small{font-size:12px}input[type=number]{width:70px;padding:7px;border:1px solid #cad9e3;border-radius:6px}#stats{font-variant-numeric:tabular-nums;margin:10px 0;line-height:1.8}#log{white-space:pre-wrap;font-size:12px;max-height:120px;overflow:auto;background:#eaf0f6;border-radius:8px;padding:10px;line-height:1.65}#preview{max-height:180px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}td,th{text-align:left;padding:6px;border-bottom:1px solid #e9eef2;word-break:break-all}#status{font-weight:600;color:#00728f}summary{cursor:pointer}#who{word-break:break-all}
+  &lt;/style&gt;
+  &lt;button id=&quot;launch&quot; class=&quot;primary&quot;&gt;关注迁移 A → B&lt;/button&gt;
+  &lt;div id=&quot;panel&quot; hidden&gt;
+    &lt;header&gt;&lt;h2&gt;关注迁移助手&lt;/h2&gt;&lt;button id=&quot;close&quot;&gt;收起&lt;/button&gt;&lt;/header&gt;
+    &lt;p class=&quot;small&quot;&gt;只添加 B 缺少的关注；不取消 A/B 的关注，不迁移分组、粉丝身份或关注时间。&lt;/p&gt;
+    &lt;div class=&quot;row&quot;&gt;&lt;span id=&quot;who&quot;&gt;当前账号：尚未读取&lt;/span&gt;&lt;button id=&quot;identify&quot;&gt;识别账号&lt;/button&gt;&lt;/div&gt;
+    &lt;section&gt;&lt;h3&gt;① 在 A 账号导出&lt;/h3&gt;&lt;p class=&quot;small&quot;&gt;先在 B站网页登录 A，再点导出。完整性检查通过后才会下载文件。&lt;/p&gt;&lt;button id=&quot;export&quot;&gt;读取并导出 A 的全部关注&lt;/button&gt;&lt;/section&gt;
+    &lt;section&gt;&lt;h3&gt;② 切换 B 账号，导入并比对&lt;/h3&gt;&lt;p class=&quot;small&quot;&gt;切换账号后刷新网页。选择刚才的 JSON 文件，比对只读取数据，不会关注任何人。&lt;/p&gt;&lt;div class=&quot;row&quot;&gt;&lt;button id=&quot;choose&quot;&gt;选择 A 的名单&lt;/button&gt;&lt;input id=&quot;file&quot; type=&quot;file&quot; accept=&quot;.json,application/json&quot; hidden&gt;&lt;button id=&quot;prepare&quot;&gt;比对 B，生成待迁移名单&lt;/button&gt;&lt;/div&gt;&lt;p id=&quot;fileinfo&quot; class=&quot;small&quot;&gt;未选择文件&lt;/p&gt;&lt;/section&gt;
+    &lt;section&gt;&lt;h3&gt;③ 迁移与核对&lt;/h3&gt;&lt;p id=&quot;route&quot;&gt;尚未建立任务&lt;/p&gt;&lt;div class=&quot;row&quot;&gt;&lt;label&gt;每次关注至少间隔 &lt;input id=&quot;delay&quot; type=&quot;number&quot; min=&quot;5&quot; max=&quot;120&quot; value=&quot;8&quot;&gt; 秒&lt;/label&gt;&lt;/div&gt;&lt;p class=&quot;small&quot;&gt;额外随机等待 0–2 秒。开始/续传前重新比对 B；失败不会被当作成功。&lt;/p&gt;&lt;div id=&quot;stats&quot;&gt;&lt;/div&gt;&lt;div class=&quot;row&quot;&gt;&lt;button id=&quot;start&quot; class=&quot;primary&quot;&gt;开始 / 继续&lt;/button&gt;&lt;button id=&quot;pause&quot;&gt;暂停&lt;/button&gt;&lt;button id=&quot;retry&quot;&gt;重试失败项&lt;/button&gt;&lt;button id=&quot;verify&quot;&gt;核对迁移结果&lt;/button&gt;&lt;/div&gt;&lt;div class=&quot;row&quot; style=&quot;margin-top:8px&quot;&gt;&lt;button id=&quot;report&quot;&gt;导出进度报告&lt;/button&gt;&lt;button id=&quot;clear&quot;&gt;清除本地任务&lt;/button&gt;&lt;/div&gt;&lt;details style=&quot;margin-top:12px&quot;&gt;&lt;summary&gt;查看名单（最多展示前 200 条）&lt;/summary&gt;&lt;div id=&quot;preview&quot;&gt;&lt;/div&gt;&lt;/details&gt;&lt;/section&gt;
+    &lt;p id=&quot;status&quot; role=&quot;status&quot; aria-live=&quot;polite&quot;&gt;准备就绪&lt;/p&gt;&lt;div id=&quot;log&quot; aria-label=&quot;操作日志&quot;&gt;进度仅保存在本浏览器的脚本存储中。\n刷新/关闭页面后不会自动继续，需手动点击“开始 / 继续”。&lt;/div&gt;
+  &lt;/div&gt;`;
+  document.documentElement.appendChild(host);
+  const $ = id =&gt; shadow.getElementById(id);
+  function log(s) {
+    const lines = ($(&#x27;log&#x27;).textContent + &#x27;\n&#x27; + new Date().toLocaleTimeString() + &#x27; &#x27; + s).split(&#x27;\n&#x27;);
+    $(&#x27;log&#x27;).textContent = lines.slice(-70).join(&#x27;\n&#x27;); $(&#x27;log&#x27;).scrollTop = $(&#x27;log&#x27;).scrollHeight;
+  }
+  function status(s) { $(&#x27;status&#x27;).textContent = s; }
+  const labels = { pending: &#x27;待迁移&#x27;, sending: &#x27;结果待核对&#x27;, success: &#x27;已新增&#x27;, existing: &#x27;已有关注，跳过&#x27;, self: &#x27;B 自己，跳过&#x27;, failed: &#x27;失败/未核实&#x27; };
+  function render() {
+    $(&#x27;who&#x27;).textContent = account ? `当前：${account.name}（UID ${account.uid}）` : &#x27;当前账号：尚未读取&#x27;;
+    $(&#x27;route&#x27;).textContent = job ? `A：${job.source.name}（${job.source.uid}） → B：${job.target.name}（${job.target.uid}）` : &#x27;尚未建立任务&#x27;;
+    const c = counts(job);
+    $(&#x27;stats&#x27;).textContent = job ? `共 ${job.items.length} 人 · 待迁移 ${c.pending} · 已新增 ${c.success} · 跳过 ${c.existing + c.self} · 失败 ${c.failed} · 待核对 ${c.sending}${job.verifiedAt ? &#x27; · 已于 &#x27; + new Date(job.verifiedAt).toLocaleString() + &#x27; 核对&#x27; : &#x27;&#x27;}` : &#x27;先导入并比对&#x27;;
+    $(&#x27;preview&#x27;).replaceChildren();
+    if (job) {
+      const table = document.createElement(&#x27;table&#x27;);
+      for (const item of job.items.slice(0, 200)) {
+        const tr = document.createElement(&#x27;tr&#x27;);
+        for (const value of [item.name || &#x27;未命名&#x27;, item.uid, labels[item.status], item.error || &#x27;&#x27;]) {
+          const td = document.createElement(&#x27;td&#x27;); td.textContent = value; tr.appendChild(td);
+        }
+        table.appendChild(tr);
+      }
+      $(&#x27;preview&#x27;).appendChild(table);
+    }
+    for (const id of [&#x27;identify&#x27;, &#x27;export&#x27;, &#x27;choose&#x27;, &#x27;clear&#x27;, &#x27;delay&#x27;]) $(id).disabled = busy;
+    $(&#x27;prepare&#x27;).disabled = busy || !sourceFile;
+    for (const id of [&#x27;start&#x27;, &#x27;retry&#x27;, &#x27;verify&#x27;, &#x27;report&#x27;]) $(id).disabled = busy || !job;
+    $(&#x27;pause&#x27;).disabled = !busy || paused;
+  }
+  function save(j) { j.updatedAt = new Date().toISOString(); GM_setValue(KEY, j); job = j; render(); }
+  function guard(expected) {
+    if (paused) throw fault(&#x27;已暂停。当前已发出的请求会先记录结果。&#x27;, &#x27;PAUSED&#x27;);
+    if (expected &amp;&amp; cookie(&#x27;DedeUserID&#x27;) !== expected) throw fault(&#x27;登录账号已变化，已停止；请切回任务的 B 账号并刷新。&#x27;, &#x27;ACCOUNT&#x27;);
+  }
+  async function wait(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() &lt; end) { guard(); await new Promise(r =&gt; setTimeout(r, Math.min(250, end - Date.now()))); }
+  }
+  async function api(path, params = {}, method = &#x27;GET&#x27;) {
+    const controller = new AbortController();
+    const timer = setTimeout(() =&gt; controller.abort(), 20000);
+    try {
+      const url = new URL(path, &#x27;https://api.bilibili.com&#x27;);
+      const options = { method, credentials: &#x27;include&#x27;, cache: &#x27;no-store&#x27;, signal: controller.signal };
+      if (method === &#x27;GET&#x27;) url.search = new URLSearchParams(params).toString();
+      else { options.headers = { &#x27;Content-Type&#x27;: &#x27;application/x-www-form-urlencoded&#x27; }; options.body = new URLSearchParams(params).toString(); }
+      const response = await fetch(url, options);
+      if (!response.ok) throw fault(`接口 HTTP ${response.status}，已暂停，请稍后再试。`, [412, 429].includes(response.status) ? response.status : &#x27;NETWORK&#x27;);
+      let json;
+      try { json = await response.json(); } catch { throw fault(&#x27;接口未返回有效数据，请稍后重试。&#x27;, &#x27;PROTOCOL&#x27;); }
+      if (!json || !Number.isInteger(json.code)) throw fault(&#x27;接口响应格式异常。&#x27;, &#x27;PROTOCOL&#x27;);
+      if (json.code !== 0) throw fault(`接口 ${json.code}：${String(json.message || &#x27;请求失败&#x27;).slice(0, 180)}`, json.code);
+      return json.data;
+    } catch (e) {
+      if (e.code !== undefined &amp;&amp; !(e instanceof DOMException)) throw e;
+      throw fault(&#x27;网络中断或超时。写入结果可能尚未返回，续传前会重新比对，避免重复关注。&#x27;, &#x27;NETWORK&#x27;);
+    } finally { clearTimeout(timer); }
+  }
+  async function identity(expected) {
+    guard(expected);
+    const data = await api(&#x27;/x/web-interface/nav&#x27;);
+    if (!data?.isLogin) throw fault(&#x27;请先登录 B站网页版。&#x27;, &#x27;ACCOUNT&#x27;);
+    const me = { uid: uid(data.mid), name: String(data.uname || &#x27;&#x27;).slice(0, 100) };
+    if ((expected &amp;&amp; me.uid !== expected) || cookie(&#x27;DedeUserID&#x27;) !== me.uid) throw fault(&#x27;账号状态不一致，请刷新网页。&#x27;, &#x27;ACCOUNT&#x27;);
+    guard(expected); account = me; render(); return me;
+  }
+  async function fullList(me) {
+    const list = await collect(me, api, wait, async expected =&gt; { guard(expected); }, (n, total) =&gt; status(`读取 ${me.name} 的关注：${n} / ${total}`));
+    await identity(me.uid);
+    return list;
+  }
+  function download(name, data) {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: &#x27;application/json&#x27; }));
+    const a = document.createElement(&#x27;a&#x27;); a.href = url; a.download = name; a.click();
+    setTimeout(() =&gt; URL.revokeObjectURL(url), 30000);
+  }
+  async function action(work) {
+    if (busy) return;
+    if (!navigator.locks) { status(&#x27;浏览器缺少任务互斥支持，请使用新版 Chrome、Edge 或 Firefox。&#x27;); return; }
+    try {
+      await navigator.locks.request(LOCK, { ifAvailable: true }, async lock =&gt; {
+        if (!lock) throw fault(&#x27;另一个 B站标签页正在执行本助手任务，请先在那里暂停。&#x27;, &#x27;LOCK&#x27;);
+        busy = true; paused = false; job = GM_getValue(KEY, null); render();
+        try { await work(); }
+        catch (e) { status(e.message); log(e.message); }
+        finally { busy = false; paused = false; render(); }
+      });
+    } catch (e) { status(e.message); log(e.message); }
+  }
+  $(&#x27;launch&#x27;).onclick = () =&gt; { $(&#x27;panel&#x27;).hidden = !$(&#x27;panel&#x27;).hidden; };
+  $(&#x27;close&#x27;).onclick = () =&gt; { $(&#x27;panel&#x27;).hidden = true; };
+  GM_registerMenuCommand(&#x27;打开关注迁移助手&#x27;, () =&gt; { $(&#x27;panel&#x27;).hidden = false; });
+  $(&#x27;identify&#x27;).onclick = () =&gt; action(async () =&gt; { await identity(); status(&#x27;账号已识别&#x27;); });
+  $(&#x27;export&#x27;).onclick = () =&gt; action(async () =&gt; {
+    const me = await identity(), users = await fullList(me);
+    download(`B站关注_A-${me.uid}_${new Date().toISOString().slice(0, 10)}.json`, { format: FORMAT, source: me, complete: true, total: users.length, exportedAt: new Date().toISOString(), users });
+    status(`已完整导出 ${users.length} 人。现在可切换 B 账号并刷新页面。`);
+  });
+  $(&#x27;choose&#x27;).onclick = () =&gt; $(&#x27;file&#x27;).click();
+  $(&#x27;file&#x27;).onchange = async () =&gt; {
+    const file = $(&#x27;file&#x27;).files[0]; if (!file) return;
+    try {
+      if (file.size &gt; 5 * 1024 * 1024) throw new Error(&#x27;文件过大，请选择本助手导出的 JSON。&#x27;);
+      sourceFile = normalize(JSON.parse(await file.text()));
+      $(&#x27;fileinfo&#x27;).textContent = `A：${sourceFile.source.name}（${sourceFile.source.uid}），${sourceFile.total} 人`;
+      status(&#x27;名单已载入，点击“比对 B”&#x27;);
+    } catch (e) { sourceFile = null; $(&#x27;fileinfo&#x27;).textContent = &#x27;导入失败&#x27;; status(e.message); }
+    $(&#x27;file&#x27;).value = &#x27;&#x27;; render();
+  };
+  $(&#x27;prepare&#x27;).onclick = () =&gt; action(async () =&gt; {
+    if (!sourceFile) throw new Error(&#x27;请先选择名单。&#x27;);
+    const me = await identity();
+    if (me.uid === sourceFile.source.uid) throw new Error(&#x27;当前仍是 A 账号，请切换 B 账号后刷新。&#x27;);
+    if (job &amp;&amp; !confirm(&#x27;生成新任务会替换本地旧任务进度（不会改变账号的已有关注）。是否继续？&#x27;)) return;
+    const current = await fullList(me);
+    const next = { version: 1, source: sourceFile.source, target: me, delay: 8, createdAt: new Date().toISOString(), items: sourceFile.users.map(u =&gt; ({ ...u, status: &#x27;pending&#x27;, error: &#x27;&#x27;, attempts: 0 })) };
+    reconcile(next, current); save(next); $(&#x27;delay&#x27;).value = next.delay;
+    status(`比对完成：${counts(next).pending} 人待迁移。请展开名单检查，再点击“开始 / 继续”。`);
+  });
+  async function migrate(retry) {
+    if (!job) throw new Error(&#x27;请先生成任务。&#x27;);
+    const delay = Number($(&#x27;delay&#x27;).value);
+    if (!Number.isFinite(delay) || delay &lt; 5 || delay &gt; 120) throw new Error(&#x27;间隔需为 5–120 秒。&#x27;);
+    job.delay = delay;
+    const me = await identity(job.target.uid);
+    if (me.uid === job.source.uid) throw new Error(&#x27;来源和目标不能是同一账号。&#x27;);
+    const current = await fullList(me); reconcile(job, current); save(job);
+    const c = counts(job), n = c.pending + (retry ? c.failed : 0);
+    if (!n) { status(c.failed ? &#x27;待迁移项已处理；还有失败项，可点击“重试失败项”。&#x27; : &#x27;名单中的 UP 已全部在 B 的关注中（B 自己除外）。&#x27;); return; }
+    if (!confirm(`目标 B：${me.name}（UID ${me.uid}）\n本次最多关注 ${n} 人，跳过已关注和 B 自己。\n每次间隔 ${delay}–${delay + 2} 秒，可随时暂停。\n是否开始？`)) { status(&#x27;已取消开始，未执行关注。&#x27;); return; }
+    status(&#x27;迁移中；请保持此页面打开，不要切换登录账号。&#x27;);
+    await runQueue(job, {
+      wait, random: Math.random, checkpoint: identity, save,
+      follow: async (id, target) =&gt; {
+        guard(target);
+        const csrf = cookie(&#x27;bili_jct&#x27;);
+        if (!csrf) throw fault(&#x27;登录凭据缺失，请重新登录并刷新。&#x27;, &#x27;ACCOUNT&#x27;);
+        return api(&#x27;/x/relation/modify&#x27;, { fid: id, act: 1, re_src: 11, csrf }, &#x27;POST&#x27;);
+      }
+    }, retry);
+    status(&#x27;本轮已结束，正在重新读取 B 的关注核对结果…&#x27;);
+    await wait(3000);
+    reconcile(job, await fullList(await identity(job.target.uid)), true); save(job);
+    status(counts(job).failed ? `核对完成，${counts(job).failed} 人仍未关注，可检查报告后重试。` : &#x27;核对通过：A 名单中的 UP 已在 B 的关注列表中（B 自己除外）。&#x27;);
+  }
+  $(&#x27;start&#x27;).onclick = () =&gt; action(() =&gt; migrate(false));
+  $(&#x27;retry&#x27;).onclick = () =&gt; action(() =&gt; migrate(true));
+  $(&#x27;pause&#x27;).onclick = () =&gt; { paused = true; status(&#x27;正在暂停：等待当前请求返回并保存，之后不再发送新请求。&#x27;); render(); };
+  $(&#x27;verify&#x27;).onclick = () =&gt; action(async () =&gt; {
+    if (!job) return;
+    reconcile(job, await fullList(await identity(job.target.uid)), true); save(job);
+    status(`核对完成：${counts(job).failed} 人尚未确认关注。`);
+  });
+  $(&#x27;report&#x27;).onclick = () =&gt; action(async () =&gt; {
+    if (!job) return;
+    download(`B站迁移报告_B-${job.target.uid}.json`, { ...job, summary: counts(job), note: &#x27;此文件为审阅报告，不含 Cookie，不用作 A 名单导入。任务续传使用当前浏览器脚本存储。&#x27; });
+    status(&#x27;已导出进度报告&#x27;);
+  });
+  $(&#x27;clear&#x27;).onclick = () =&gt; action(async () =&gt; {
+    if (!confirm(&#x27;只删除本浏览器保存的任务进度，不会取关任何人。确定清除？&#x27;)) return;
+    GM_deleteValue(KEY); job = null; status(&#x27;本地任务已清除&#x27;); render();
+  });
+  if (job) $(&#x27;delay&#x27;).value = job.delay;
+  window.addEventListener(&#x27;beforeunload&#x27;, e =&gt; { if (busy) { e.preventDefault(); e.returnValue = &#x27;&#x27;; } });
+  render();
+})();
+</textarea></details><p class="muted">本安装页不访问你的账号。安装后也需你手动确认才会关注。先登录 A 导出，再切到 B 并刷新。</p></main><script>document.getElementById('copy').onclick=async()=>{const area=document.getElementById('code'),msg=document.getElementById('message');try{await navigator.clipboard.writeText(area.value);msg.textContent='已复制。到 Tampermonkey 的新脚本编辑器粘贴并保存。'}catch{document.querySelector('details').open=true;area.focus();area.select();msg.textContent='请按 Command + C 复制已选中的完整脚本，再到 Tampermonkey 粘贴。'}};</script></html>
